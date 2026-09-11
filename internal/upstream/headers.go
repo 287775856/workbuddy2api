@@ -9,11 +9,18 @@ import (
 )
 
 const (
-	clientUA        = "CLI/2.63.2 CodeBuddy/2.63.2"
-	originRefererCN = "https://www.codebuddy.cn"
+	clientUA            = "CLI/2.63.2 CodeBuddy/2.63.2"
+	originRefererCN     = "https://www.codebuddy.cn"
+	originRefererGlobal = "https://www.workbuddy.ai"
 )
 
+// originRefererFor 按账号 region 返回 Origin/Referer 基址。
+// Global 账号必须带 workbuddy.ai 的 Origin —— 上游会校验来源，
+// 用 CN origin 请求 Global 端点会被判为跨站请求而拒绝。
 func originRefererFor(a *auth.Auth) string {
+	if isGlobalRealm(a) {
+		return originRefererGlobal
+	}
 	return originRefererCN
 }
 

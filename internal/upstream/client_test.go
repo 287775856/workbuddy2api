@@ -334,9 +334,14 @@ func TestBasesAlwaysCN(t *testing.T) {
 	if c.chatBase(cn) != "https://chat.example" || c.billingBase(cn) != "https://billing.example" {
 		t.Error("cn bases wrong")
 	}
-	// 恒 CN：domain 不同不改变上游 host。
+	// 未知 domain（非 workbuddy.ai）仍走 CN base：区域分流只认 workbuddy.ai，
+	// 其他值一律按 CN 处理，老凭证行为不变。
 	if c.chatBase(other) != c.chatBase(cn) || c.billingBase(other) != c.billingBase(cn) {
-		t.Error("bases must be CN regardless of domain")
+		t.Error("unknown domain must keep CN bases")
+	}
+	// workbuddy.ai 才切到 Global realm。
+	if !isGlobalRealm(&auth.Auth{Domain: "www.workbuddy.ai"}) {
+		t.Error("www.workbuddy.ai should be classified as Global realm")
 	}
 }
 

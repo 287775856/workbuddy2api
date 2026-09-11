@@ -2,8 +2,10 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -63,7 +65,15 @@ func NewHandler(cfg Config) *Handler {
 	}
 	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
+	// Per-account pinned endpoints. A gateway that wants to round-robin at
+	// ITS layer (e.g. 9Router with N connections) needs one target per
+	// account, otherwise every connection would race for the same shared
+	// pool Pick(). /v1/a/<uid>/... pins every request to that account.
+	h.mux.HandleFunc("POST /v1/a/{uid}/chat/completions", h.withAuth(h.pinnedChat))
+	h.mux.HandleFunc("GET /v1/a/{uid}/quota", h.withAuth(h.pinnedQuota))
+	h.mux.HandleFunc("GET /v1/accounts", h.withAuth(h.accounts))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
+	h.mux.HandleFunc("GET /v1/quota", h.withAuth(h.quota))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
 	return h
@@ -71,6 +81,35 @@ func NewHandler(cfg Config) *Handler {
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.mux.ServeHTTP(w, r)
+}
+
+// ---------------------------------------------------------------------------
+// 会话粘性安全包装
+//
+// h.cfg.Session 可为 nil（config 里 session_sticky.enabled=false）。原实现只在
+// 「提取会话键」处判了 nil，而解绑/绑定路径直接调 h.cfg.Session.Unbind/Bind ——
+// 一旦 Session 为 nil 且走到这些分支就会 nil 解引用 panic，整个网关进程崩溃。
+//
+// 触发条件在 /v1/a/<uid>/chat/completions（账号固定端点）上尤其容易满足：
+// 该端点把 uid 直接当 stickyUID 用，账号 token 需刷新或请求失败时会走 fail()，
+// 而 fail() 内部就是 Unbind。即「关闭会话粘性 + 使用固定号端点 + 该号请求失败」
+// 三个条件同时成立即崩。故所有会话操作统一走下面这层 nil-safe 包装。
+// ---------------------------------------------------------------------------
+
+// bindSession 绑定会话；Session 为 nil（粘性关闭）时静默跳过。
+func (h *Handler) bindSession(key, uid string) {
+	if h.cfg.Session == nil || key == "" || uid == "" {
+		return
+	}
+	h.cfg.Session.Bind(key, uid)
+}
+
+// unbindSession 解绑会话；Session 为 nil 时静默跳过。
+func (h *Handler) unbindSession(key string) {
+	if h.cfg.Session == nil || key == "" {
+		return
+	}
+	h.cfg.Session.Unbind(key)
 }
 
 func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
@@ -125,16 +164,270 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// 静态 CN 模型表（api-reference §5，动态接口失败时的回退）。
+// quota reports per-account credit packages (used/total/remaining/reset) in
+// the 9Router dashboard quota shape: {plan, quotas:{<name>:{used,total,
+// remaining,resetAt,unlimited,recurring}}}. Fetched live from the upstream
+// billing endpoint for every healthy account in the pool.
+// accounts lists every pool member with its pinned endpoint, so an upstream
+// gateway (9Router etc.) can create one connection per account and round-robin
+// across them instead of sharing a single pooled connection.
+func (h *Handler) accounts(w http.ResponseWriter, r *http.Request) {
+	list := h.cfg.Pool.List()
+	type acct struct {
+		UID       string `json:"uid"`
+		Nickname  string `json:"nickname,omitempty"`
+		Credits   int64  `json:"credits"`
+		Cooling   bool   `json:"cooling"`
+		Disabled  bool   `json:"disabled"`
+		ChatPath  string `json:"chat_path"`
+		QuotaPath string `json:"quota_path"`
+		CoolUntil string `json:"cool_until,omitempty"`
+		Remaining string `json:"cool_remaining,omitempty"`
+	}
+	out := make([]acct, 0, len(list))
+	for _, st := range list {
+		a := acct{
+			UID:       st.UID,
+			Nickname:  st.Nickname,
+			Credits:   st.Credits,
+			Cooling:   st.Cooling,
+			Disabled:  st.Disabled,
+			ChatPath:  "/v1/a/" + st.UID + "/chat/completions",
+			QuotaPath: "/v1/a/" + st.UID + "/quota",
+		}
+		if st.Cooling && !st.Until.IsZero() {
+			a.CoolUntil = st.Until.Format(time.RFC3339)
+			a.Remaining = time.Until(st.Until).Round(time.Second).String()
+		}
+		out = append(out, a)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"provider": "workbuddy", "accounts": out})
+}
+
+// pinnedChat serves /v1/a/<uid>/chat/completions by pinning to that account.
+func (h *Handler) pinnedChat(w http.ResponseWriter, r *http.Request) {
+	uid := r.PathValue("uid")
+	if uid == "" {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "missing account uid")
+		return
+	}
+	if h.cfg.Pool.PeekByUID(uid) == nil {
+		writeOpenAIError(w, http.StatusNotFound, "not_found", "account not found: "+uid)
+		return
+	}
+	h.chatCompletions(w, r)
+}
+
+// pinnedQuota serves /v1/a/<uid>/quota — same payload as /v1/quota but only
+// that one account, so a per-account connection reports its own credits.
+func (h *Handler) pinnedQuota(w http.ResponseWriter, r *http.Request) {
+	uid := r.PathValue("uid")
+	if uid == "" {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "missing account uid")
+		return
+	}
+	// 复用缓存的全量结果再过滤，避免每个 per-account 连接都触发一轮全池探测
+	// （N 个连接 × N 个账号 = N² 次上游调用）。
+	all := h.cachedAccountQuotas()
+	for _, a := range all {
+		if a.UID == uid {
+			writeJSON(w, http.StatusOK, map[string]any{
+				"provider": "workbuddy",
+				"accounts": []accountQuota{a},
+			})
+			return
+		}
+	}
+	writeOpenAIError(w, http.StatusNotFound, "not_found", "account not found: "+uid)
+}
+
+// quotaProbeTimeout 单次配额探测的总预算：所有账号探测共享这一个 deadline。
+//
+// 为什么需要总预算：上游单次调用超时是 120s（Client.HTTP.Timeout），若按账号串行探测，
+// N 个账号最坏要 N×120s（46 账号 ≈ 92 分钟），请求早已被客户端/反代掐断，连接与
+// 上游配额也被白白占用。这里给整体探测一个上限并并发执行，超时的账号按"未知"返回。
+const quotaProbeTimeout = 15 * time.Second
+
+// quotaCacheTTL /v1/quota 结果的缓存时长。
+//
+// 为什么必须缓存：配额看板通常按秒级轮询，而每次调用都会向上游逐个账号打 billing 接口。
+// 无缓存时多账号 + 高频轮询会直接触发上游限流。缓存一份短 TTL 结果，既保证数据接近实时，
+// 又把上游调用量压到「每 TTL 一次」。
+const quotaCacheTTL = 30 * time.Second
+
+// quotaCache 缓存上一次配额探测结果（按 UID 索引）。
+var quotaCache struct {
+	sync.RWMutex
+	rows []accountQuota
+	at   time.Time
+}
+
+func (h *Handler) quota(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"provider": "workbuddy",
+		"accounts": h.cachedAccountQuotas(),
+	})
+}
+
+// cachedAccountQuotas 返回缓存结果；缓存过期或为空时重新探测。
+func (h *Handler) cachedAccountQuotas() []accountQuota {
+	quotaCache.RLock()
+	if len(quotaCache.rows) > 0 && time.Since(quotaCache.at) < quotaCacheTTL {
+		rows := quotaCache.rows
+		quotaCache.RUnlock()
+		return rows
+	}
+	quotaCache.RUnlock()
+
+	rows := h.buildAccountQuotas()
+	quotaCache.Lock()
+	quotaCache.rows = rows
+	quotaCache.at = time.Now()
+	quotaCache.Unlock()
+	return rows
+}
+
+// buildAccountQuotas returns one quota row per pool account (shared by /v1/quota
+// and the per-account /v1/a/<uid>/quota endpoint).
+//
+// 账号间并发探测、整体受 quotaProbeTimeout 约束：慢/挂住的账号不会拖垮整个响应。
+func (h *Handler) buildAccountQuotas() []accountQuota {
+	accounts := h.cfg.Pool.List()
+	out := make([]accountQuota, len(accounts))
+
+	// 整体 deadline：用带超时的 context 逐账号约束探测调用。
+	ctx, cancel := context.WithTimeout(context.Background(), quotaProbeTimeout)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	for i, st := range accounts {
+		aq := accountQuota{
+			UID:          st.UID,
+			Nickname:     st.Nickname,
+			Credits:      st.Credits,
+			Cooling:      st.Cooling,
+			CoolKind:     st.CoolKind,
+			Reason:       st.Reason,
+			Disabled:     st.Disabled,
+			SuccessCount: st.SuccessCount,
+			ErrTotal:     st.ErrTotal,
+		}
+		if st.Cooling && !st.Until.IsZero() {
+			aq.CoolUntil = st.Until.Format(time.RFC3339)
+			aq.CoolRemaining = formatRemaining(time.Until(st.Until))
+		}
+		out[i] = aq
+
+		a := h.cfg.Pool.PeekByUID(st.UID)
+		if a == nil {
+			out[i].Error = "account not in pool; no credential available for a quota probe"
+			continue
+		}
+		// Skip the live billing probe while the account is cooling — upstream
+		// is already throttling it and another call just extends the 429s.
+		if st.Cooling {
+			out[i].Error = "cooling: quota probe skipped to avoid extending rate limit"
+			continue
+		}
+
+		wg.Add(1)
+		go func(i int, a *auth.Auth) {
+			defer wg.Done()
+			// 每个探测独立成 goroutine；写自己的下标，无数据竞争。
+			pkgs, err := h.cfg.Upstream.ResourcePackages(a)
+			if err != nil {
+				out[i].Error = err.Error()
+				return
+			}
+			out[i].Quotas = make(map[string]upstream.ResourcePackage, len(pkgs))
+			seen := map[string]int{}
+			for _, p := range pkgs {
+				name := p.PackageName
+				seen[name]++
+				if seen[name] > 1 {
+					name = fmt.Sprintf("%s %d", name, seen[name])
+				}
+				out[i].Quotas[name] = p
+			}
+		}(i, a)
+	}
+
+	// 等待全部探测完成或整体超时；超时后未完成的账号标记为"未知"，
+	// goroutine 因各自 HTTP 超时最终会退出，不会泄漏。
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-ctx.Done():
+		for i := range out {
+			if out[i].Quotas == nil && out[i].Error == "" {
+				out[i].Error = "quota probe timed out"
+			}
+		}
+	}
+	return out
+}
+
+// formatRemaining 把冷却剩余时长格式化成 "2h 13m 05s" 风格，
+// 便于看板直接展示（与 ISO 截止时间并列给出）。
+func formatRemaining(d time.Duration) string {
+	if d <= 0 {
+		return ""
+	}
+	h := int(d.Hours())
+	m := int(d.Minutes()) % 60
+	s := int(d.Seconds()) % 60
+	if h > 0 {
+		return fmt.Sprintf("%dh %02dm %02ds", h, m, s)
+	}
+	if m > 0 {
+		return fmt.Sprintf("%dm %02ds", m, s)
+	}
+	return fmt.Sprintf("%ds", s)
+}
+
+// accountQuota is one pool account's credit/cooling snapshot.
+type accountQuota struct {
+	UID      string `json:"uid"`
+	Nickname string `json:"nickname,omitempty"`
+	Credits  int64  `json:"credits"`
+	Cooling  bool   `json:"cooling"`
+	CoolKind string `json:"cool_kind,omitempty"`
+	// ISO deadline of the active cooldown ("until"), plus pre-formatted
+	// "2h 13m 05s"-style remaining time so dashboards can render both.
+	CoolUntil     string                              `json:"cool_until,omitempty"`
+	CoolRemaining string                              `json:"cool_remaining,omitempty"`
+	Reason        string                              `json:"reason,omitempty"`
+	Disabled      bool                                `json:"disabled"`
+	SuccessCount  int64                               `json:"success_count,omitempty"`
+	ErrTotal      int64                               `json:"err_total,omitempty"`
+	Quotas        map[string]upstream.ResourcePackage `json:"quotas"`
+	Error         string                              `json:"error,omitempty"`
+}
+
+// 静态模型表（api-reference §5 回退 + WorkBuddy GLOBAL catalog 2026-09-07）。
 var staticModels = []map[string]any{
-	{"id": "glm-5.2", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
-	{"id": "glm-5.1", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
-	{"id": "glm-5v-turbo", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
-	{"id": "kimi-k2.7", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
-	{"id": "minimax-m3", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
+	{"id": "hy4-preview", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 1000000},
 	{"id": "hy3", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
 	{"id": "hy3-preview", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
 	{"id": "hy3-preview-agent", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
+	{"id": "gpt-5.6-sol", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 400000},
+	{"id": "gpt-5.6-terra", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 400000},
+	{"id": "gpt-5.6-luna", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 400000},
+	{"id": "gpt-5.5", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 400000},
+	{"id": "gpt-5.4", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 400000},
+	{"id": "gpt-5.3-codex", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 400000},
+	{"id": "gemini-3.5-flash", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 1000000},
+	{"id": "glm-5.3", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 200000},
+	{"id": "glm-5.2", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
+	{"id": "glm-5.1", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
+	{"id": "glm-5v-turbo", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
+	{"id": "kimi-k3", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 256000},
+	{"id": "kimi-k2.7", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
+	{"id": "minimax-m3", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
 	{"id": "deepseek-v4-pro", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
 	{"id": "deepseek-v4-flash", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
 }
@@ -241,7 +534,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 会话粘性：从请求体提取会话键并解析绑定号（找不到/无效则 stickyUID 为空，走普通轮换）。
 	sessKey := ""
 	stickyUID := ""
-	if h.cfg.Session != nil {
+	// Account pinning: /v1/a/<uid>/chat/completions forces every request to
+	// that one account so an upstream gateway can round-robin across its own
+	// per-account connections instead of racing the shared pool Pick().
+	if pinUID := r.PathValue("uid"); pinUID != "" {
+		stickyUID = pinUID
+	}
+	if stickyUID == "" && h.cfg.Session != nil {
 		sessKey = session.ExtractKey(body)
 		if sessKey != "" {
 			if uid, ok := h.cfg.Session.Resolve(sessKey); ok {
@@ -267,7 +566,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	fail := func(uid string) {
 		releaseHeld()
 		if stickyUID != "" && uid == stickyUID {
-			h.cfg.Session.Unbind(sessKey)
+			h.unbindSession(sessKey)
 			stickyUID = ""
 		}
 	}
@@ -279,7 +578,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			acct = h.cfg.Pool.PickByUID(stickyUID)
 			if acct == nil {
 				// 粘性号当前不可用（冷却/占满）→ 解绑，本次回落普通轮换。
-				h.cfg.Session.Unbind(sessKey)
+				h.unbindSession(sessKey)
 				stickyUID = ""
 			}
 		}
@@ -298,7 +597,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 若被抢的正是粘性号，立即解绑并回落普通轮换，避免下一轮仍撞同一个
 			// 满载粘性号再浪费一次 PickByUID 往返（语义与 fail()/PickByUID-nil 的解绑一致）。
 			if stickyUID != "" && acct.UID == stickyUID {
-				h.cfg.Session.Unbind(sessKey)
+				h.unbindSession(sessKey)
 				stickyUID = ""
 			}
 			continue // 最后一个名额被并发抢走 → 换号
@@ -344,8 +643,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		h.cfg.Pool.NoteSuccess(acct.UID)
 		// 粘性跟随最终成功号：本轮成功的账号成为该会话的粘性绑定（覆盖旧绑定）。
 		// 若 sticky 号失败、轮换到别的号成功，这里把会话重绑到新号，多轮对话下一跳不再随机抽。
-		if sessKey != "" && h.cfg.Session != nil {
-			h.cfg.Session.Bind(sessKey, acct.UID)
+		if sessKey != "" {
+			h.bindSession(sessKey, acct.UID)
 		}
 		if peek.Stream {
 			// 流式：透传结束后立即关闭上游 body，避免 defer 在轮转场景下堆积 fd。

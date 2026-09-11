@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# login.sh — WorkBuddy CN OAuth 登录 → 落盘 auth 文件
+# login.sh — WorkBuddy OAuth 登录 → 落盘 auth 文件
 #
 # 用法:
-#   ./login.sh
+#   ./login.sh            # CN realm（默认，行为与以前一致）
+#   ./login.sh global     # GLOBAL realm（workbuddy.ai）
 #
 # 流程:
 #   1. POST /v2/plugin/auth/state 拿授权 URL（无 PKCE，state 由服务端签发）
@@ -15,6 +16,13 @@ cd "$(dirname "$0")"
 AUTH_DIR="./auths"
 CONTAINER="workbuddy2api"
 
+# 区域：cn（默认）| global。Global 账号走 workbuddy.ai，CN 账号走 codebuddy.cn。
+REGION="${1:-cn}"
+case "$REGION" in
+    cn|global) ;;
+    *) echo "未知区域: $REGION（可选 cn | global）" >&2; exit 1 ;;
+esac
+
 mkdir -p "$AUTH_DIR"
 
 # login 工具：不存在才编译（源码改动后手动 go build -o login ./cmd/login）
@@ -24,11 +32,11 @@ if [[ ! -x "$LOGIN_BIN" ]]; then
 fi
 
 echo "============================================================"
-echo "  WorkBuddy OAuth 登录"
+echo "  WorkBuddy OAuth 登录（区域: $REGION）"
 echo "============================================================"
 echo ""
 
-AUTH_URL=$("$LOGIN_BIN" url)
+AUTH_URL=$("$LOGIN_BIN" url "$REGION")
 
 echo "请在浏览器中打开以下链接完成登录："
 echo ""
@@ -51,7 +59,7 @@ fi
 echo ""
 echo "正在获取 token..."
 
-RESULT=$("$LOGIN_BIN" poll) || {
+RESULT=$("$LOGIN_BIN" poll "$REGION") || {
     echo ""
     echo "获取 token 失败。可能原因："
     echo "  - 登录还没完成就按了 y（重新运行 ./login.sh 再试）"
@@ -155,6 +163,7 @@ fi
 echo ""
 echo "============================================================"
 echo "  登录完成！"
+echo "  区域: $REGION"
 echo "  UID: $USER_ID"
 echo "  Nickname: ${NICKNAME:-（未获取到）}"
 echo "  Token: ${TOKEN:0:30}..."

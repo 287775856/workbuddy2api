@@ -168,8 +168,13 @@ type Client struct {
 	// SanitizeFingerprints 出站请求体黑名单指纹脱敏开关（默认 true；false 完全还原）。
 	SanitizeFingerprints bool
 
+	// ChatBaseCN/BillingBaseCN CN realm（copilot.tencent.com / codebuddy.cn）。
 	ChatBaseCN    string
 	BillingBaseCN string
+	// ChatBaseGlobal/BillingBaseGlobal GLOBAL realm（workbuddy.ai）。
+	// 按账号 domain 选择：见 chatBase()/billingBase()。
+	ChatBaseGlobal    string
+	BillingBaseGlobal string
 }
 
 // New 生产默认值。配置连接池减少 TLS 握手。
@@ -187,6 +192,8 @@ func New() *Client {
 		SanitizeFingerprints: true,
 		ChatBaseCN:           "https://copilot.tencent.com",
 		BillingBaseCN:        "https://www.codebuddy.cn",
+		ChatBaseGlobal:       "https://www.workbuddy.ai",
+		BillingBaseGlobal:    "https://www.workbuddy.ai",
 	}
 }
 
@@ -198,7 +205,30 @@ func (c *Client) chatHTTP() *http.Client {
 	return c.HTTP
 }
 
+// isGlobalRealm 判断账号属于 GLOBAL realm（workbuddy.ai）还是 CN realm。
+//
+// 判据是账号凭证里的 domain —— cmd/login 会把上游返回的 domain 落盘，
+// Global 登录得到的 domain 是 www.workbuddy.ai。
+// 兼容两种写法：完整域名（www.workbuddy.ai）与裸域（workbuddy.ai）。
+// domain 为空（老凭证/CN 凭证）一律按 CN 处理，保持既有行为不变。
+func isGlobalRealm(a *auth.Auth) bool {
+	if a == nil {
+		return false
+	}
+	d := strings.ToLower(strings.TrimSpace(a.Domain))
+	if d == "" {
+		return false
+	}
+	// 去掉可能的 scheme 前缀，避免 "https://www.workbuddy.ai" 之类写法漏判。
+	d = strings.TrimPrefix(strings.TrimPrefix(d, "https://"), "http://")
+	return d == "workbuddy.ai" || strings.HasSuffix(d, ".workbuddy.ai")
+}
+
+// chatBase 按账号 region 返回聊天基址（Global → workbuddy.ai，其余 → CN）。
 func (c *Client) chatBase(a *auth.Auth) string {
+	if isGlobalRealm(a) && c.ChatBaseGlobal != "" {
+		return c.ChatBaseGlobal
+	}
 	return c.ChatBaseCN
 }
 
@@ -221,7 +251,11 @@ func (c *Client) effortsSnapshot() map[string][]string {
 	return cp
 }
 
+// billingBase 按账号 region 返回计费基址（Global → workbuddy.ai，其余 → CN）。
 func (c *Client) billingBase(a *auth.Auth) string {
+	if isGlobalRealm(a) && c.BillingBaseGlobal != "" {
+		return c.BillingBaseGlobal
+	}
 	return c.BillingBaseCN
 }
 
