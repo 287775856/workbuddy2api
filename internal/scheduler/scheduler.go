@@ -182,10 +182,17 @@ func (s *Scheduler) RunKeepaliveNow() {
 			log.Printf("keepalive %s: %v", st.UID, err)
 			var ue *upstream.Error
 			if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
-				s.cfg.Pool.Disable(st.UID, "12153 session dead")
+				// 连续 N 次才判死：12153 会被临时性触发（网络抖动/上游闪断/refresh
+				// 竞态），一次失败即永久禁用会误杀健康账号。
+				if s.cfg.Pool.NoteSessionDead(st.UID) {
+					log.Printf("keepalive %s: 连续 %d 次 session dead，已禁用（需重新登录）",
+						st.UID, pool.SessionDeadThreshold())
+				}
 			}
 			continue
 		}
+		// refresh 成功：session 未死，清连续 12153 计数。
+		s.cfg.Pool.ClearSessionDead(st.UID)
 		if err := a.SaveAtomic(); err != nil {
 			log.Printf("keepalive %s save: %v", st.UID, err)
 		}

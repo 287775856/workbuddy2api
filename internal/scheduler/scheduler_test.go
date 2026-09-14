@@ -278,10 +278,65 @@ func TestRunKeepaliveSessionDeadDisables(t *testing.T) {
 		BillingBaseCN: srv.URL,
 	}
 	s := New(Config{Pool: p, Upstream: up})
+
+	// 12153 连续 N 次才禁用：前 N-1 次刷新失败不应杀号（防误判）。
+	threshold := pool.SessionDeadThreshold()
+	for i := 1; i < threshold; i++ {
+		s.RunKeepaliveNow()
+		if st, _ := p.Status("u1"); st.Disabled {
+			t.Fatalf("第 %d 次 12153 不应禁用: %+v", i, st)
+		}
+	}
+	// 第 N 次连续 12153 → 禁用，并透出禁用原因。
 	s.RunKeepaliveNow()
 	st, _ := p.Status("u1")
 	if !st.Disabled {
-		t.Errorf("should disable session-dead account: %+v", st)
+		t.Errorf("第 %d 次连续 12153 应禁用: %+v", threshold, st)
+	}
+	if st.DisabledReason != "12153 session dead" {
+		t.Errorf("disabled_reason=%q want 12153 session dead", st.DisabledReason)
+	}
+}
+
+// TestRunKeepaliveSessionDeadResetBySuccess 中间刷新成功应清零连续计数：
+// 之后再出现 12153 从第 1 次重新计，不因历史失败被追杀。
+func TestRunKeepaliveSessionDeadResetBySuccess(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 第 3 次调用（第二轮 keepalive）返回成功，模拟 session 恢复。
+		if calls.Add(1) == 3 {
+			w.Write([]byte(`{"code":0,"data":{"accessToken":"new","expiresIn":3600}}`))
+			return
+		}
+		w.WriteHeader(401)
+		w.Write([]byte(`{"code":12153,"msg":"Offline user session not found"}`))
+	}))
+	defer srv.Close()
+
+	p := pool.New("")
+	a := &auth.Auth{UID: "u1", AccessToken: "old", RefreshToken: "rt", ExpiresAt: 1}
+	p.Add(a)
+
+	up := &upstream.Client{
+		HTTP:          srv.Client(),
+		ChatBaseCN:    srv.URL,
+		BillingBaseCN: srv.URL,
+	}
+	s := New(Config{Pool: p, Upstream: up})
+
+	s.RunKeepaliveNow() // 第 1 次：12153
+	s.RunKeepaliveNow() // 第 2 次：12153
+	s.RunKeepaliveNow() // 第 3 次：成功 → 清计数
+
+	if st, _ := p.Status("u1"); st.Disabled {
+		t.Fatalf("中途成功后不应禁用: %+v", st)
+	}
+	// 计数已清零：再来 threshold-1 次 12153 仍不应禁用。
+	for i := 1; i < pool.SessionDeadThreshold(); i++ {
+		s.RunKeepaliveNow()
+		if st, _ := p.Status("u1"); st.Disabled {
+			t.Fatalf("计数应已清零，第 %d 次不应禁用: %+v", i, st)
+		}
 	}
 }
 
