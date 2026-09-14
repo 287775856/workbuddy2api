@@ -3,13 +3,21 @@
   "api_key": "your-api-key-here",
   "auth_dir": "./auths",
   "state_file": "./data/state.json",
+  "server": {
+    "max_body_mb": 8
+  },
   "cooldown": {
     "soft_rate": "600s",
     "soft_rate_max": "2h"
   },
   "schedule": {
-    "checkin_hours": [9, 21],
-    "keepalive_hours": [22],
+    "checkin_hours": [
+      9,
+      21
+    ],
+    "keepalive_hours": [
+      22
+    ],
     "checkin_enabled": true,
     "keepalive_enabled": true
   },

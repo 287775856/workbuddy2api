@@ -17,6 +17,14 @@ type Config struct {
 	AuthDir   string `json:"auth_dir"`   // ./auths
 	StateFile string `json:"state_file"` // ./data/state.json
 
+	Server struct {
+		// MaxBodyMB 聊天请求体大小上限（单位 MB，默认 8）。
+		// 请求体超过该值直接返回 413 request_body_too_large，不再静默截断后喂给上游
+		// （issue #41：截断的 JSON 让上游 unmarshal 报 unexpected EOF，网关却罚号）。
+		// 0/负数视为非法 → normalize 回落默认。
+		MaxBodyMB int `json:"max_body_mb"`
+	} `json:"server"`
+
 	Cooldown struct {
 		// hard_credit / err_threshold / err_cooldown 三个历史键已退役：
 		// 硬冷却固定为次日 04:00（CooldownUntilTomorrow4AM），连续错误语义并入熔断器。
@@ -104,6 +112,8 @@ func Default() *Config {
 	c.Schedule.CheckinEnabled = true
 	c.Schedule.KeepaliveEnabled = true
 	c.Upstream.TimeoutSeconds = 120
+	// 聊天请求体上限默认 8MB（超限 413，不静默截断）。
+	c.Server.MaxBodyMB = 8
 	// HeaderTimeoutSeconds/IdleTimeoutSeconds 默认 0（未设置态），回落见 normalize()。
 	c.Upstream.HeaderTimeoutSeconds = 0
 	c.Upstream.IdleTimeoutSeconds = 0
@@ -163,6 +173,11 @@ func applyEnv(c *Config) {
 			c.Upstream.TimeoutSeconds = n
 		}
 	}
+	if v := os.Getenv("WB2A_MAX_BODY_MB"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.Server.MaxBodyMB = n
+		}
+	}
 	if v := os.Getenv("WB2A_HEADER_TIMEOUT_SECONDS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			c.Upstream.HeaderTimeoutSeconds = n
@@ -215,6 +230,10 @@ func (c *Config) normalize() error {
 	}
 	if c.Upstream.TimeoutSeconds <= 0 {
 		c.Upstream.TimeoutSeconds = 120
+	}
+	// 请求体上限：0/负数视为非法 → 回落默认 8MB。
+	if c.Server.MaxBodyMB <= 0 {
+		c.Server.MaxBodyMB = 8
 	}
 	// header 缺省回落 timeout（保"首字节前换号"既有语义）；idle 缺省走内置大值。
 	// 任务书约定：0 一律视为"未设置"走默认，真正的"禁用"留待后续（避免歧义）。
