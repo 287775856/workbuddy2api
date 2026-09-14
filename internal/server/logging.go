@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+
+	"workbuddy2api/internal/metrics"
 )
 
 // chatSeq 进程级请求序号。
@@ -29,6 +31,11 @@ type chatStat struct {
 	toks   int // <0 表示 usage 缺失 → 显示 "-"
 	status int
 
+	// usage 完整 usage 明细（流式末帧 / 非流式聚合响应），供统计模块提取缓存与扣费。
+	usage *UsageDetail
+	// collector 非 nil 时在 done() 里把本次请求记入统计。
+	collector *metrics.Collector
+
 	logged bool
 }
 
@@ -41,16 +48,47 @@ func newChatStat(now time.Time, body []byte, stream bool) *chatStat {
 	return &chatStat{start: now, model: parseModelFromBody(body), mode: mode, toks: -1}
 }
 
-// done 幂等落一行表格日志。
+// done 幂等落一行表格日志，并把本次请求记入统计（若挂了 collector）。
+//
+// 放在 done() 而不是各 return 点：done 是 defer 调用，任何出口（成功/失败/轮转耗尽/
+// panic 恢复）都会走到，统计不会漏记。
 func (s *chatStat) done() {
 	if s.logged {
 		return
 	}
 	s.logged = true
+	s.record()
 	logChatRow(s.ttfb, time.Since(s.start), s.model, s.mode, s.uid, s.status, s.toks)
 }
 
-// chatStatsReader 在流式透传时抓取 SSE 末帧的 usage.completion_tokens 精确值，
+// record 把本次请求写入统计收集器。
+func (s *chatStat) record() {
+	if s.collector == nil {
+		return
+	}
+	d := metrics.Delta{
+		Model:    s.model,
+		Stream:   s.mode == "stream",
+		OK:       s.status >= 200 && s.status < 300,
+		TTFB:     s.ttfb,
+		Latency:  time.Since(s.start),
+		HasUsage: s.usage != nil,
+	}
+	if u := s.usage; u != nil {
+		d.PromptTokens = u.PromptTokens
+		d.CompletionTokens = u.CompletionTokens
+		d.TotalTokens = u.TotalTokens
+		d.CacheHitTokens = u.CacheHitTokens
+		d.CacheMissTokens = u.CacheMissTokens
+		d.CacheWriteTokens = u.CacheWriteTokens
+		d.CacheReadTokens = u.CacheReadTokens
+		d.CacheCreationTokens = u.CacheCreationTokens
+		d.Credit = u.Credit
+	}
+	s.collector.Record(d)
+}
+
+// chatStatsReader 在流式透传时抓取 SSE 末帧的完整 usage（token 明细 + 缓存 + 扣费），
 // 并记录首个 data 帧的 TTFB；原始字节原样返回给下游透传。
 // 注意：不做 rune 估算，token 数一律采信上游 usage。
 type chatStatsReader struct {
@@ -60,7 +98,9 @@ type chatStatsReader struct {
 	seen     bool // 已见过首个 data 帧（TTFB 只记一次）
 	hasUsage bool // 末帧是否带 usage
 	tokens   int
-	pend     []byte // 已读未返回的行缓存
+	// usage 末帧完整 usage 对象（供统计模块提取缓存命中/扣费等字段）。
+	usage *UsageDetail
+	pend  []byte // 已读未返回的行缓存
 }
 
 // newChatStatsReaderSince 以 since 为 TTFB 计时起点（通常是请求进入 handler 的时刻）。
@@ -74,7 +114,10 @@ func (s *chatStatsReader) TTFB() time.Duration { return s.ttfb }
 // Tokens 返回末帧 usage.completion_tokens 与是否缺失；无 usage 时 ok=false。
 func (s *chatStatsReader) Tokens() (int, bool) { return s.tokens, s.hasUsage }
 
-// parseSSELine 解析一行 "data: {...}"：首帧记 TTFB，含 usage 时采信精确 completion_tokens。
+// Usage 返回末帧完整 usage 明细（无 usage 时为 nil）。
+func (s *chatStatsReader) Usage() *UsageDetail { return s.usage }
+
+// parseSSELine 解析一行 "data: {...}"：首帧记 TTFB，含 usage 时解析完整明细。
 func (s *chatStatsReader) parseSSELine(line string) {
 	line = strings.TrimRight(line, "\r\n")
 	if !strings.HasPrefix(line, "data: ") {
@@ -88,16 +131,18 @@ func (s *chatStatsReader) parseSSELine(line string) {
 		s.seen = true
 		s.ttfb = time.Since(s.start)
 	}
+	// 用宽松 map 解析：usage 字段名在不同模型/区域间有差异（见 UsageDetail 注释），
+	// 结构体标签写死会漏字段。
 	var chunk struct {
-		Usage *struct {
-			CompletionTokens int `json:"completion_tokens"`
-		} `json:"usage"`
+		Usage map[string]any `json:"usage"`
 	}
 	if json.Unmarshal([]byte(payload), &chunk) != nil || chunk.Usage == nil {
 		return
 	}
 	s.hasUsage = true
-	s.tokens = chunk.Usage.CompletionTokens
+	u := ParseUsage(chunk.Usage)
+	s.usage = u
+	s.tokens = int(u.CompletionTokens)
 }
 
 // Read 返回原始数据，同时解析统计 TTFB/token。
@@ -140,6 +185,86 @@ func completionTokens(resp map[string]any) int {
 		return -1
 	}
 	return int(v)
+}
+
+// UsageDetail 上游 usage 的归一化明细。
+//
+// 为什么用宽松解析而不是写死结构体标签：上游不同模型/区域返回的字段命名不一致，
+// 至少存在两套缓存命名——
+//
+//	Anthropic 风格：cache_creation_input_tokens / cache_read_input_tokens
+//	OpenAI 风格：  prompt_cache_hit_tokens / prompt_cache_miss_tokens / cached_tokens
+//
+// 写死一套会漏另一套的缓存数据（而缓存恰恰是扣费差异最大的部分）。
+type UsageDetail struct {
+	PromptTokens     int64
+	CompletionTokens int64
+	TotalTokens      int64
+
+	CacheHitTokens      int64
+	CacheMissTokens     int64
+	CacheWriteTokens    int64
+	CacheReadTokens     int64
+	CacheCreationTokens int64
+
+	// Credit 上游返回的实际扣费（部分模型带 credit 字段）。
+	Credit float64
+}
+
+// ParseUsage 把上游 usage 对象归一化为 UsageDetail。
+// 字段缺失一律按 0 处理（不猜、不估算）。
+func ParseUsage(u map[string]any) *UsageDetail {
+	d := &UsageDetail{
+		PromptTokens:     int64Field(u, "prompt_tokens"),
+		CompletionTokens: int64Field(u, "completion_tokens"),
+		TotalTokens:      int64Field(u, "total_tokens"),
+
+		// OpenAI 风格缓存字段
+		CacheHitTokens:   int64Field(u, "prompt_cache_hit_tokens"),
+		CacheMissTokens:  int64Field(u, "prompt_cache_miss_tokens"),
+		CacheWriteTokens: int64Field(u, "prompt_cache_write_tokens"),
+		// Anthropic 风格缓存字段
+		CacheReadTokens:     int64Field(u, "cache_read_input_tokens"),
+		CacheCreationTokens: int64Field(u, "cache_creation_input_tokens"),
+
+		Credit: float64Field(u, "credit"),
+	}
+	// 两套命名都有时取较大值，避免重复累计导致命中率虚高
+	// （同一份数据被两个字段名各报一次的场景）。
+	if v := int64Field(u, "cached_tokens"); v > d.CacheHitTokens {
+		d.CacheHitTokens = v
+	}
+	// total 缺失时用 prompt+completion 补齐（便于面板直接展示）。
+	if d.TotalTokens == 0 {
+		d.TotalTokens = d.PromptTokens + d.CompletionTokens
+	}
+	return d
+}
+
+// int64Field 从 map 取整数字段（兼容 JSON number 的 float64 与字符串数字）。
+func int64Field(m map[string]any, key string) int64 {
+	switch v := m[key].(type) {
+	case float64:
+		return int64(v)
+	case int64:
+		return v
+	case int:
+		return int64(v)
+	}
+	return 0
+}
+
+// float64Field 从 map 取浮点字段。
+func float64Field(m map[string]any, key string) float64 {
+	switch v := m[key].(type) {
+	case float64:
+		return v
+	case int64:
+		return float64(v)
+	case int:
+		return float64(v)
+	}
+	return 0
 }
 
 // uidPrefix 只显示 uid 前 8 位；空 uid 显示 "-"。

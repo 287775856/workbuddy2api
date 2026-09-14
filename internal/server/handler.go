@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/metrics"
 	"workbuddy2api/internal/pool"
 	"workbuddy2api/internal/session"
 	"workbuddy2api/internal/upstream"
@@ -28,6 +29,9 @@ type Config struct {
 	// MaxBodyBytes 聊天请求体大小上限；<=0 兜底 8<<20（8MB）。
 	// 超限直接 413 request_body_too_large（不再静默截断喂给上游，issue #41）。
 	MaxBodyBytes int64
+	// Metrics 请求统计收集器（可选；nil = 不统计）。
+	// 网关是所有流量（含非面板客户端）的唯一必经点，统计在此采集。
+	Metrics *metrics.Collector
 	// Session 会话粘性路由器（可选；nil = 关闭粘性，纯 Pick 轮换）。
 	Session *session.Router
 	// StickyCount 返回当前粘性会话绑定数（供 /status）；nil 时报告 0。
@@ -79,6 +83,9 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("GET /v1/a/{uid}/quota", h.withAuth(h.pinnedQuota))
 	h.mux.HandleFunc("GET /v1/accounts", h.withAuth(h.accounts))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
+	// 请求统计：所有经本网关的请求（含绕过面板的客户端）按模型聚合。
+	h.mux.HandleFunc("GET /v1/stats", h.withAuth(h.stats))
+	h.mux.HandleFunc("POST /v1/stats/reset", h.withAuth(h.statsReset))
 	h.mux.HandleFunc("GET /v1/quota", h.withAuth(h.quota))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
@@ -146,6 +153,39 @@ func (h *Handler) healthz(w http.ResponseWriter, r *http.Request) {
 		"total":   total,
 		"service": ServiceName,
 	})
+}
+
+// stats 返回按模型聚合的请求统计（面板「统计」页数据源）。
+//
+// 采集点在这里而不是面板：网关是所有流量（含绕过面板的客户端）的唯一必经点，
+// 只有在网关侧才能统计到完整调用，且不依赖面板是否在运行。
+func (h *Handler) stats(w http.ResponseWriter, r *http.Request) {
+	if h.cfg.Metrics == nil {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"enabled": false,
+			"message": "统计未启用（server.metrics_enabled=false）",
+		})
+		return
+	}
+	snap := h.cfg.Metrics.Derived()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"enabled":    true,
+		"since":      snap.Since,
+		"now":        snap.Now,
+		"uptime_sec": snap.UptimeSec,
+		"total":      snap.Total,
+		"models":     snap.Models,
+	})
+}
+
+// statsReset 清空统计（运维手动归零，便于观察某个时间点之后的增量）。
+func (h *Handler) statsReset(w http.ResponseWriter, r *http.Request) {
+	if h.cfg.Metrics == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "message": "统计未启用"})
+		return
+	}
+	h.cfg.Metrics.Reset()
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": "统计已重置"})
 }
 
 func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
@@ -543,6 +583,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	// 请求级统计：出口即打一行表格日志（任何路径都会走到）。
 	st := newChatStat(time.Now(), body, peek.Stream)
+	st.collector = h.cfg.Metrics
 	defer st.done()
 
 	tried := map[string]bool{}
@@ -672,6 +713,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			_ = upstream.Stream(w, stats)
 			st.ttfb = stats.TTFB()
 			st.toks, _ = stats.Tokens()
+			st.usage = stats.Usage()
 			rc.Close()
 			return
 		}
@@ -686,6 +728,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, resp)
 		st.status = http.StatusOK
 		st.toks = completionTokens(resp)
+		if u, ok := resp["usage"].(map[string]any); ok {
+			st.usage = ParseUsage(u)
+		}
 		return
 	}
 	msg := "all accounts unavailable (cooling/disabled)"

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/metrics"
 	"workbuddy2api/internal/pool"
 	"workbuddy2api/internal/redisstore"
 	"workbuddy2api/internal/scheduler"
@@ -113,6 +114,13 @@ func main() {
 		log.Printf("token 保活已禁用（schedule.keepalive_enabled=false）")
 	}
 
+	// 请求统计收集器：网关是所有流量的必经点，在此采集（含绕过面板的客户端）。
+	var metricsCollector *metrics.Collector
+	if cfg.Server.MetricsEnabled {
+		metricsCollector = metrics.New(cfg.Server.MetricsFile)
+		defer metricsCollector.Flush() // 退出前落盘
+	}
+
 	h := server.NewHandler(server.Config{
 		Pool:         p,
 		Upstream:     up,
@@ -122,6 +130,7 @@ func main() {
 		RedisMode:    redisMode,
 		SoftCooldown: cfg.SoftRateDur,
 		MaxBodyBytes: int64(cfg.Server.MaxBodyMB) << 20,
+		Metrics:      metricsCollector,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -141,6 +150,11 @@ func main() {
 		_ = srv.Shutdown(shutdownCtx)
 	}()
 
+	if cfg.Server.MetricsEnabled {
+		log.Printf("请求统计: 已启用 → %s（GET /v1/stats）", cfg.Server.MetricsFile)
+	} else {
+		log.Printf("请求统计: 已禁用（server.metrics_enabled=false）")
+	}
 	log.Printf("workbuddy2api listening on %s (api_key=%v)", cfg.Listen, cfg.APIKey != "")
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("http: %v", err)

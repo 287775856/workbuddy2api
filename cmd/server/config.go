@@ -23,6 +23,12 @@ type Config struct {
 		// （issue #41：截断的 JSON 让上游 unmarshal 报 unexpected EOF，网关却罚号）。
 		// 0/负数视为非法 → normalize 回落默认。
 		MaxBodyMB int `json:"max_body_mb"`
+		// MetricsEnabled 是否采集按模型的请求统计（默认 true）。
+		// 关闭后 /v1/stats 返回 enabled=false，不影响转发。
+		MetricsEnabled bool `json:"metrics_enabled"`
+		// MetricsFile 统计持久化文件；空 = 纯内存（重启清零）。
+		// 默认 ./data/metrics.json，重启后累计值不丢。
+		MetricsFile string `json:"metrics_file"`
 	} `json:"server"`
 
 	Cooldown struct {
@@ -114,6 +120,9 @@ func Default() *Config {
 	c.Upstream.TimeoutSeconds = 120
 	// 聊天请求体上限默认 8MB（超限 413，不静默截断）。
 	c.Server.MaxBodyMB = 8
+	// 请求统计默认开启并持久化到 state_file 同目录。
+	c.Server.MetricsEnabled = true
+	c.Server.MetricsFile = "./data/metrics.json"
 	// HeaderTimeoutSeconds/IdleTimeoutSeconds 默认 0（未设置态），回落见 normalize()。
 	c.Upstream.HeaderTimeoutSeconds = 0
 	c.Upstream.IdleTimeoutSeconds = 0
@@ -234,6 +243,9 @@ func (c *Config) normalize() error {
 	// 请求体上限：0/负数视为非法 → 回落默认 8MB。
 	if c.Server.MaxBodyMB <= 0 {
 		c.Server.MaxBodyMB = 8
+		// 请求统计默认开启并持久化到 state_file 同目录。
+		c.Server.MetricsEnabled = true
+		c.Server.MetricsFile = "./data/metrics.json"
 	}
 	// header 缺省回落 timeout（保"首字节前换号"既有语义）；idle 缺省走内置大值。
 	// 任务书约定：0 一律视为"未设置"走默认，真正的"禁用"留待后续（避免歧义）。

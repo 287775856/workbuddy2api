@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/metrics"
 	"workbuddy2api/internal/upstream"
 )
 
@@ -230,5 +231,78 @@ func TestChatModelRateLimit6004FutureResetCooldown(t *testing.T) {
 	// 触发模型应被记录（供换模型豁免）。
 	if model, isModel := p.ModelSoftCooldown("u1"); !isModel || model != "glm-5.2" {
 		t.Errorf("应记录触发模型 glm-5.2, 得到 %q (isModel=%v)", model, isModel)
+	}
+}
+
+// TestStatsRecordsByModel 端到端：经网关的请求必须被计入统计，且按模型分开。
+func TestStatsRecordsByModel(t *testing.T) {
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 200, sseOK, true
+	})
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	col := metrics.New("")
+	h := NewHandler(Config{Pool: p, Upstream: up, Metrics: col})
+
+	// 两个模型各发一次。
+	for _, model := range []string{"glm-5.1", "glm-5.1", "deepseek-v4.1-flash"} {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+			strings.NewReader(`{"model":"`+model+`","messages":[]}`)))
+	}
+
+	snap := col.Snapshot()
+	if len(snap.Models) != 2 {
+		t.Fatalf("应有 2 个模型, 得到 %d", len(snap.Models))
+	}
+	if m := snap.Models["glm-5.1"]; m == nil || m.Requests != 2 {
+		t.Errorf("glm-5.1 应记 2 次: %+v", m)
+	}
+	if m := snap.Models["deepseek-v4.1-flash"]; m == nil || m.Requests != 1 {
+		t.Errorf("deepseek-v4.1-flash 应记 1 次: %+v", m)
+	}
+	// 假上游返回的 SSE 带 usage 时也应解析出 token。
+	if snap.Total.Requests != 3 {
+		t.Errorf("总请求数 = %d, want 3", snap.Total.Requests)
+	}
+}
+
+// TestStatsEndpoint 未启用统计时 /v1/stats 返回 enabled=false 而不是报错。
+func TestStatsEndpointDisabled(t *testing.T) {
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) { return 200, sseOK, true })
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up}) // 不注入 Metrics
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/v1/stats", nil))
+	if rec.Code != 200 {
+		t.Fatalf("code=%d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), `"enabled":false`) {
+		t.Errorf("应返回 enabled=false: %s", rec.Body)
+	}
+}
+
+// TestStatsEndpointEnabled 启用后 /v1/stats 返回按模型的派生指标。
+func TestStatsEndpointEnabled(t *testing.T) {
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) { return 200, sseOK, true })
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	col := metrics.New("")
+	h := NewHandler(Config{Pool: p, Upstream: up, Metrics: col})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.1","messages":[]}`)))
+
+	rec2 := httptest.NewRecorder()
+	h.ServeHTTP(rec2, httptest.NewRequest("GET", "/v1/stats", nil))
+	if rec2.Code != 200 {
+		t.Fatalf("code=%d", rec2.Code)
+	}
+	body := rec2.Body.String()
+	if !strings.Contains(body, `"enabled":true`) {
+		t.Errorf("应返回 enabled=true: %s", body)
+	}
+	if !strings.Contains(body, "glm-5.1") {
+		t.Errorf("应含模型名: %s", body)
 	}
 }

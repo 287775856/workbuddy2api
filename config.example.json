@@ -4,7 +4,9 @@
   "auth_dir": "./auths",
   "state_file": "./data/state.json",
   "server": {
-    "max_body_mb": 8
+    "max_body_mb": 8,
+    "metrics_enabled": true,
+    "metrics_file": "./data/metrics.json"
   },
   "cooldown": {
     "soft_rate": "600s",
