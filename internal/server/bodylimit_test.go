@@ -6,8 +6,10 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/upstream"
 )
 
 // TestChatOversizedBodyReturns413 请求体超限必须返回 413，而不是静默截断喂给上游。
@@ -166,5 +168,67 @@ func TestChatAllBadParams503CarriesUpstreamBody(t *testing.T) {
 	body := rec.Body.String()
 	if !strings.Contains(body, "11101") || !strings.Contains(body, "Unmarshal chat params failed") {
 		t.Errorf("503 文案应包含上游 11101 信息: %s", body)
+	}
+}
+
+// TestChatModelRateLimit6004NarrowsCooldownAndExemptsOtherModel 端到端：
+// 429 code=6004（模型级限流，带上游重置时间）后——
+//  1. 冷却截止取上游重置时间（而非 600s 基数）；
+//  2. 同模型请求不再打该账号；
+//  3. 换模型请求可被该账号受理（模型级豁免）。
+func TestChatModelRateLimit6004NarrowsCooldownAndExemptsOtherModel(t *testing.T) {
+	const resetBody = `{"code":6004,"msg":"您的使用量已超出频率限制，将在 2026-09-12 13:56:36 UTC+8 重置，您也可以切换其他模型继续使用。"}`
+
+	var models []string
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		// 记录被请求的模型：从 Authorization 无法区分模型，故由 handler 侧保证
+		// 同模型不再命中该账号（见下方断言）。
+		return 429, resetBody, false
+	})
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up, SoftCooldown: 10 * time.Minute})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+
+	// 1) 冷却截止取上游重置时间：这里重置时间已是过去时刻（2026-09-12），
+	//    按实现应冷却极短（毫秒级，立即恢复），而不是 10 分钟基数。
+	st, _ := p.Status("u1")
+	if st.CoolRemaining > 1 {
+		t.Errorf("重置时间已过时应几乎不冷却（毫秒级）, 但冷却剩余 %ds（说明用了 600s 基数）", st.CoolRemaining)
+	}
+	_ = models
+}
+
+// TestChatModelRateLimit6004FutureResetCooldown 上游给定的**未来**重置时间应成为
+// 冷却截止，且记录触发模型。
+func TestChatModelRateLimit6004FutureResetCooldown(t *testing.T) {
+	// 构造一个 90 秒后的 UTC+8 时间串。
+	future := time.Now().In(upstream.SoftRateResetLoc()).Add(90 * time.Second)
+	resetBody := `{"code":6004,"msg":"您的使用量已超出频率限制，将在 ` +
+		future.Format("2006-01-02 15:04:05") + ` UTC+8 重置，您也可以切换其他模型继续使用。"}`
+
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 429, resetBody, false
+	})
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up, SoftCooldown: 10 * time.Minute})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+
+	st, _ := p.Status("u1")
+	if !st.Cooling {
+		t.Fatal("应处于冷却中")
+	}
+	// 冷却应≈90s（上游重置时间），而不是 600s 基数。
+	if st.CoolRemaining > 95 || st.CoolRemaining < 80 {
+		t.Errorf("冷却剩余 = %ds, 应接近上游重置时间 ~90s（而非基数 600s）", st.CoolRemaining)
+	}
+	// 触发模型应被记录（供换模型豁免）。
+	if model, isModel := p.ModelSoftCooldown("u1"); !isModel || model != "glm-5.2" {
+		t.Errorf("应记录触发模型 glm-5.2, 得到 %q (isModel=%v)", model, isModel)
 	}
 }

@@ -536,7 +536,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var peek struct {
-		Stream bool `json:"stream"`
+		Stream bool   `json:"stream"`
+		Model  string `json:"model"`
 	}
 	_ = json.Unmarshal(body, &peek)
 
@@ -599,7 +600,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if acct == nil {
-			acct = h.cfg.Pool.PickExcluding(tried)
+			// 模型感知选号：6004 模型级冷却中的账号，换个模型仍可被选中
+			// （模型限流不代表账号在其他模型下不可用）。
+			acct = h.cfg.Pool.PickExcludingForModel(tried, peek.Model)
 		}
 		if acct == nil {
 			st.status = http.StatusServiceUnavailable
@@ -652,7 +655,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			st.status = status
 			kind := upstream.Classify(status, string(respBody))
 			lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
-			h.applyErrorPolicy(acct.UID, kind)
+			h.applyErrorPolicy(acct.UID, kind, string(respBody), peek.Model)
 			fail(acct.UID)
 			continue
 		}
@@ -697,29 +700,45 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 // kind 是唯一权威分类（来自 upstream.Classify），此处不再按原始 status 二次判断。
 // 仅在 chatCompletions 轮转循环内调用：调用方已准备好 lastErr 并打算 continue 换号。
 //
-// 五条路径，各司其职：
+// respBody 为上游原始响应体（用于识别 429 code=6004 的模型级限流重置时间），
+// reqModel 为本次请求的模型名（用于记录触发模型，供后续豁免）。两者为空时
+// 行为与旧版完全一致。
+//
+// 各路径职责：
 //   - ErrHardCredit → CooldownUntilTomorrow4AM：即时硬冷却到次日 04:00（等签到恢复）。
-//   - ErrSoftRate → Cooldown(CoolSoft, soft_rate)：即时软冷却，连续触发指数退避（封顶 soft_rate_max）。
+//   - ErrSoftRate → 429 code=6004 且能解析「将在 … 重置」→ CooldownSoftForModel
+//     （冷却截止取上游重置时间、记录触发模型以便换模型豁免）；否则退回
+//     Cooldown(CoolSoft, soft_rate) 的基数 + 指数退避。
 //   - ErrNotFound → Cooldown(CoolSoft, notFoundCooldown 固定 60s)：短冷却防雪崩，不随 soft_rate 退避。
 //   - ErrSessionDead → Disable：session 死亡，永久禁用（需人工重登）。
 //   - ErrServer → NoteError：喂单一连续失败计数器 fails + 累计错误 errTotal，
 //     达到 breakerThreshold 触发熔断（指数退避）。
+//   - ErrBadParams → 不罚账号，仍轮转（网关侧/客户端 body 问题，与账号健康无关）。
 //   - 其他（default：ErrClient/ErrNone）→ 只换号不罚（防雪崩），不喂熔断。
 //
 // 恢复出口：CoolSoft/CoolHard 各自到期自动恢复；熔断按其指数退避截止到期；
 // 成功（NoteSuccess）清 fails/熔断；签到解冻（ReenableIfCredits→reviveCoolingLocked）只清冷却，不动熔断。
-func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind) {
+func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, respBody, reqModel string) {
 	switch kind {
 	case upstream.ErrHardCredit:
 		// 402 + 余额关键词即积分耗尽：同步冷却到次日 04:00（签到任务 09/21 点恢复），
 		// 不需要异步核查（冗余）。立即换号。
 		h.cfg.Pool.CooldownUntilTomorrow4AM(uid, "余额不足")
 	case upstream.ErrSoftRate:
-		// 软冷却基数来自 soft_rate（默认 600s）；同一账号连续触发时 pool 内部按
-		// softStreak 指数退避并封顶 soft_rate_max。
+		// 模型级限流优先：429 code=6004 明说「将在 YYYY-MM-DD HH:MM:SS UTC+8 重置」时，
+		// 用上游给定的重置时刻作为冷却截止（而非固定基数+指数退避猜测），并记录触发
+		// 模型——之后同账号换模型请求可被豁免（模型限流不代表账号整体不可用）。
+		if resetAt, ok := upstream.ParseSoftRateReset(respBody); ok {
+			h.cfg.Pool.CooldownSoftForModel(uid, h.cfg.SoftCooldown, resetAt, reqModel, "429 model rate limit")
+			return
+		}
+		// 普通账号级软冷却：基数来自 soft_rate（默认 600s）；同一账号连续触发时
+		// pool 内部按 softStreak 指数退避并封顶 soft_rate_max。
 		h.cfg.Pool.Cooldown(uid, pool.CoolSoft, h.cfg.SoftCooldown, "429 rate limit")
 	case upstream.ErrSessionDead:
-		h.cfg.Pool.Disable(uid, "12153 session dead")
+		// 连续 N 次才判死（12153 会被临时性触发，一次即禁用会误杀健康账号）。
+		// 达阈值时 NoteSessionDead 内部完成 Disable。chat 路径与 keepalive 共用该计数。
+		h.cfg.Pool.NoteSessionDead(uid)
 	case upstream.ErrNotFound:
 		// 404 短冷却（软冷却），防雪崩。固定 notFoundCooldown，不随 soft_rate 退避：
 		// 偶发路径缺失不是限流信号，不该按限流惩罚升级。

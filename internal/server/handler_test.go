@@ -256,7 +256,7 @@ func TestApplyErrorPolicySoftRateExponentialBackoff(t *testing.T) {
 	h := NewHandler(Config{Pool: p, SoftCooldown: 600 * time.Second})
 
 	for i, want := range []int64{600, 1200, 2400} {
-		h.applyErrorPolicy("u1", upstream.ErrSoftRate)
+		h.applyErrorPolicy("u1", upstream.ErrSoftRate, "", "")
 		st, _ := p.Status("u1")
 		if !st.Cooling || st.CoolKind != "soft_rate" {
 			t.Fatalf("call %d: 应为 soft_rate 冷却: %+v", i+1, st)
@@ -283,7 +283,7 @@ func TestApplyErrorPolicyNotFoundUsesFixedBase(t *testing.T) {
 
 	notFoundSec := int64(notFoundCooldown / time.Second)
 	for i, want := range []int64{notFoundSec, 2 * notFoundSec, 4 * notFoundSec} {
-		h.applyErrorPolicy("u1", upstream.ErrNotFound)
+		h.applyErrorPolicy("u1", upstream.ErrNotFound, "", "")
 		st, _ := p.Status("u1")
 		if !st.Cooling || st.CoolKind != "soft_rate" {
 			t.Fatalf("call %d: 应为 soft 冷却: %+v", i+1, st)
@@ -301,7 +301,7 @@ func TestApplyErrorPolicyNotFoundUsesFixedBase(t *testing.T) {
 	// 成功后 streak 归零 → 下次 404 回到 60s 基数。
 	// （签到解冻 ReenableIfCredits 不适用于本场景：它保留 streak，是冷却域的续期。）
 	p.NoteSuccess("u1")
-	h.applyErrorPolicy("u1", upstream.ErrNotFound)
+	h.applyErrorPolicy("u1", upstream.ErrNotFound, "", "")
 	if st, _ := p.Status("u1"); st.SoftStreak != 1 || st.CoolRemaining > notFoundSec {
 		t.Errorf("success should reset 404 backoff: %+v", st)
 	}
@@ -510,15 +510,27 @@ func TestChatSessionDeadDisables(t *testing.T) {
 	})
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
 	h := NewHandler(Config{Pool: p, Upstream: up})
-	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`))
+
+	// 12153 连续 N 次才禁用（防误杀）：前 N-1 次只报错不禁用账号。
+	threshold := pool.SessionDeadThreshold()
+	for i := 1; i < threshold; i++ {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+			strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+		if st, _ := p.Status("u1"); st.Disabled {
+			t.Fatalf("第 %d 次 12153 不应禁用: %+v", i, st)
+		}
+	}
+	// 第 N 次达阈值 → 禁用，请求返回 503。
 	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
 	if rec.Code != 503 {
 		t.Errorf("code=%d", rec.Code)
 	}
 	st, _ := p.Status("u1")
 	if !st.Disabled {
-		t.Errorf("account should be disabled: %+v", st)
+		t.Errorf("第 %d 次连续 12153 应禁用账号: %+v", threshold, st)
 	}
 }
 
