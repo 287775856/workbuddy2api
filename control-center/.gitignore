@@ -1,0 +1,7 @@
+/data/
+web/node_modules/
+web/tsconfig.tsbuildinfo
+internal/webui/dist/assets/
+.workbuddy-ai/
+.playwright-cli/
+.DS_Store

@@ -1,0 +1,10 @@
+{
+  "listen": "127.0.0.1:8787",
+  "auth_dir": "../auths",
+  "data_dir": "./data",
+  "username": "admin",
+  "password": "请替换为强密码",
+  "read_only": false,
+  "timezone": "Asia/Shanghai",
+  "timeout_seconds": 30
+}

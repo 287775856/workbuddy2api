@@ -1,0 +1,18 @@
+services:
+  workbuddy-control-center:
+    build: .
+    container_name: workbuddy-control-center
+    ports:
+      - "127.0.0.1:8787:8787"
+    environment:
+      WBCC_LISTEN: "0.0.0.0:8787"
+      WBCC_AUTH_DIR: "/auths"
+      WBCC_DATA_DIR: "/data"
+      WBCC_USERNAME: "admin"
+      # 从本机环境注入，未设置时 Compose 会拒绝启动。
+      WBCC_PASSWORD: "${WBCC_PASSWORD:?请先设置 WBCC_PASSWORD}"
+    volumes:
+      # 唯一与网关共享的内容：WorkBuddy OAuth 凭据。
+      - ../auths:/auths
+      - ./data:/data
+    restart: unless-stopped
