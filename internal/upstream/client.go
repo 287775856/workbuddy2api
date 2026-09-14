@@ -27,6 +27,7 @@ const (
 	ErrSessionDead                // 401 + 12153 offline session 失效 → 禁用
 	ErrNotFound                   // 404 上游偶发 → 短冷却，不累计错误计数（防雪崩）
 	ErrServer                     // 5xx 上游故障
+	ErrBadParams                  // 请求体解析失败（400 + Unmarshal chat params failed / 11101）→ 不罚账号，仍轮转
 	ErrClient                     // 其他 4xx / 业务错误
 )
 
@@ -42,6 +43,8 @@ func (k ErrKind) String() string {
 		return "not_found"
 	case ErrServer:
 		return "server"
+	case ErrBadParams:
+		return "bad_params"
 	case ErrClient:
 		return "client"
 	default:
@@ -104,6 +107,13 @@ var sessionDeadMarkers = []string{"Offline user session not found", "12153"}
 //     结果同为 soft_rate，与下一层一致。
 //  4. status==429 —— body 无文案时的兜底识别。
 //  5. 404 / 5xx / 其他 4xx —— 与限流无关的常规分类。
+//
+// badParamsMarkers 请求体解析失败关键词（issue #41 连带）：HTTP 400 + 上游
+// "Unmarshal chat params failed..."（code 11101）。这是"发给上游的 body 有问题"，
+// 与账号健康无关——不罚号，但仍轮转（不同账号可能有不同模型权限，值得再试）。
+var badParamsMarkerMsg = "Unmarshal chat params failed"
+var badParamsMarkerCode = `"code":11101`
+
 func Classify(status int, body string) ErrKind {
 	if status == http.StatusPaymentRequired {
 		return ErrHardCredit
@@ -134,6 +144,13 @@ func Classify(status int, body string) ErrKind {
 		return ErrServer
 	}
 	if status >= 400 {
+		// 请求体解析失败（HTTP 400 + Unmarshal chat params failed / code 11101）：
+		// 这是"发给上游的 body 有问题"。网关侧截断已由 413 消灭（issue #41），
+		// 剩余来源是客户端 JSON 本身畸形——换了账号照样 400，不该罚号
+		// （白白冷却好号）。判在通用 4xx 之前，避免与限流文案误判混淆。
+		if strings.Contains(body, badParamsMarkerMsg) || strings.Contains(body, badParamsMarkerCode) {
+			return ErrBadParams
+		}
 		return ErrClient
 	}
 	// HTTP 200 但业务 code 非 0 且含余额关键词的情况已被上面 hardMarkers 捕获。

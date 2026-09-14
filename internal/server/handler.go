@@ -727,6 +727,11 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind) {
 	case upstream.ErrServer:
 		// 5xx 上游故障：Classify 已把 ≥500 判为 ErrServer，在此喂熔断计数（不再手写 status>=500）。
 		h.cfg.Pool.NoteError(uid)
+	case upstream.ErrBadParams:
+		// 请求体解析失败（400 + Unmarshal chat params failed / 11101）：发给上游的 body
+		// 有问题（网关截断已由 413 消灭，剩余为客户端畸形 JSON）。换了账号照样 400，
+		// 不罚账号（无冷却/熔断/NoteError）；但**仍然轮转**（不同账号可能有不同的模型
+		// 权限，值得换号再试一次）。此处显式列出而非落 default，是为了让语义自解释。
 	default:
 		// 其余（ErrClient/ErrNone）：只换号不罚（防雪崩），不喂熔断。
 	}

@@ -106,3 +106,65 @@ func TestChatBodyAtLimitAllowed(t *testing.T) {
 		t.Error("等于上限的请求应正常转发到上游")
 	}
 }
+
+// TestChatBadParamsRotatesWithoutPenalty 上游 400 + 11101（请求体解析失败）应：
+// 换号重试并成功，且被换掉的账号**不留任何惩罚痕迹**（无冷却/熔断/errTotal）。
+//
+// 背景（issue #41 连带）：这本质是"发给上游的 body 有问题"，与账号健康无关；
+// 旧分类把它归为通用 ErrClient，一旦 body 同时命中限流文案还会被误判 soft_rate 罚号。
+func TestChatBadParamsRotatesWithoutPenalty(t *testing.T) {
+	calls := map[string]int{}
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		calls[authz]++
+		if authz == "Bearer at-bad" {
+			return 400, `{"code":11101,"msg":"Unmarshal chat params failed with error: unexpected EOF"}`, false
+		}
+		return 200, sseOK, true
+	})
+	p := testPoolWith(
+		&auth.Auth{UID: "bad", AccessToken: "at-bad", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "good", AccessToken: "at-good", ExpiresAt: 9999999999},
+	)
+	// 让 bad 积分更高被优先选中（确定性轮转：bad 失败 → good）。
+	p.SetCredits("bad", 2000)
+	p.SetCredits("good", 1000)
+
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s（应换号到 good 后成功）", rec.Code, rec.Body)
+	}
+	if calls["Bearer at-bad"] != 1 || calls["Bearer at-good"] != 1 {
+		t.Errorf("calls=%v want bad/good 各 1 次", calls)
+	}
+	// 关键断言：bad 账号完好无损。
+	st, _ := p.Status("bad")
+	if st.Cooling || st.Disabled || st.ErrTotal != 0 || st.BreakerFails != 0 {
+		t.Errorf("11101 不应惩罚账号: %+v", st)
+	}
+}
+
+// TestChatAllBadParams503CarriesUpstreamBody 全部账号都返回 11101 时，
+// 503 文案必须带上上游原始信息（便于定位是客户端 body 问题）。
+func TestChatAllBadParams503CarriesUpstreamBody(t *testing.T) {
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 400, `{"code":11101,"msg":"Unmarshal chat params failed with error: unexpected EOF"}`, false
+	})
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+
+	if rec.Code != 503 {
+		t.Fatalf("code=%d body=%s want 503", rec.Code, rec.Body)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "11101") || !strings.Contains(body, "Unmarshal chat params failed") {
+		t.Errorf("503 文案应包含上游 11101 信息: %s", body)
+	}
+}

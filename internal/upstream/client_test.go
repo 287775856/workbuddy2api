@@ -407,3 +407,28 @@ func TestChatHTTPNilFallsBackToHTTP(t *testing.T) {
 		t.Error("chatHTTP() should fall back to HTTP when ChatHTTP is nil")
 	}
 }
+
+// TestClassifyBadParams 请求体解析失败（400 + Unmarshal chat params failed / 11101）
+// 归 ErrBadParams：不罚账号，但仍轮转。
+func TestClassifyBadParams(t *testing.T) {
+	cases := []struct {
+		name   string
+		status int
+		body   string
+		want   ErrKind
+	}{
+		{"11101 文案", 400, `{"code":11101,"msg":"Unmarshal chat params failed: unexpected end of JSON input"}`, ErrBadParams},
+		{"11101 仅 code", 400, `{"code":11101}`, ErrBadParams},
+		{"其他 400 仍 ErrClient", 400, `{"code":1,"msg":"bad request"}`, ErrClient},
+		// 反向锚定：余额/限流优先级高于 bad_params，不得回归。
+		{"余额优先", 402, `Unmarshal chat params failed`, ErrHardCredit},
+	}
+	for _, c := range cases {
+		if got := Classify(c.status, c.body); got != c.want {
+			t.Errorf("%s: Classify(%d) = %v, want %v", c.name, c.status, got, c.want)
+		}
+	}
+	if ErrBadParams.String() != "bad_params" {
+		t.Errorf("ErrBadParams.String() = %q", ErrBadParams.String())
+	}
+}
